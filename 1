@@ -1,0 +1,230 @@
+##系统报错改为英文
+Sys.setenv(LANGUAGE = "en")
+##禁止转化为因子
+options(stringsAsFactors = FALSE)
+##清空环境
+rm(list=ls())
+
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+library(dplyr)
+
+#创建一个文件夹用于写分析结果
+sam.name <- "r7.4"
+
+if(!dir.exists(sam.name)){
+  dir.create(sam.name)
+}
+
+#####数据合并
+scRNA.counts= Read10X_h5("E:/lbb/ST/PAAD/10X/PAAD_GSE154778/PAAD_GSE154778_expression.h5")#16,14000,GM
+scRNA.counts1= Read10X_h5("E:/lbb/ST/PAAD/10X/PAAD_CRA001160/PAAD_CRA001160.h5")#最大的35病人，57000，cellresearch
+
+scRNA = CreateSeuratObject(scRNA.counts ,min.cells = 3,project="N", min.features = 300)
+
+scRNA1= CreateSeuratObject(scRNA.counts1 ,min.cells = 3,project="T", min.features = 300)
+
+#细胞及细胞中基因与RNA数量
+#三，消除批次效应#########
+library(devtools)
+library(harmony)
+scRNA_harmony <- merge(scRNA, y=scRNA1)
+
+######数据合并#####
+
+###查看数据情况#########
+#查看SeuratObject中的对象
+slotNames(scRNA)
+slotNames(scRNA1)
+
+ncol(x = scRNA_harmony)   #列数
+nrow(x = scRNA_harmony)   #行数
+dim(scRNA_harmony)  # 行数和列数
+#细胞及细胞中基因与RNA数量
+dim(scRNA)
+[1] 19985 14953
+dim(scRNA1)
+[1] 21066 57443
+
+####三，消除批次效应#########
+library(devtools)
+library(harmony)
+scRNA_harmony <- merge(scRNA, y=scRNA1)
+scRNA_harmony <- NormalizeData(scRNA_harmony) %>% FindVariableFeatures() %>% ScaleData() %>% RunPCA(verbose=FALSE)
+##整合
+system.time({scRNA_harmony <- RunHarmony(scRNA_harmony, group.by.vars = "orig.ident")})
+#  
+scRNA_harmony <- RunUMAP(scRNA_harmony, reduction = "harmony", dims = 1:30)
+scRNA_harmony <- FindNeighbors(scRNA_harmony, reduction = "harmony", dims = 1:30) %>% FindClusters()
+##作图
+#group_by_cluster
+plot1 = DimPlot(scRNA_harmony, reduction = "umap", label=T) 
+ 
+#group_by_sample
+plot2 = DimPlot(scRNA_harmony, reduction = "umap", group.by='orig.ident') 
+
+#combinate
+plotc <- plot1+plot2
+ggsave("scRNA_harmony.png", plot = plotc, width = 10, height = 5)
+saveRDS(scRNA_harmony, 'scRNA_harmony.rds')
+
+########四，质控#########
+scRNA_harmony<-scRNA1
+matrix<- as.matrix(scRNA_harmony@assays$RNA@counts)
+
+##QC：统计线粒体基因在每个细胞中的占比
+scRNA_harmony[["percent.mt"]] <- PercentageFeatureSet(scRNA_harmony, 
+                                                             pattern = "^MT-")
+pdf(paste0("./",sam.name,"/QC-VlnPlot.pdf"),width = 8,height = 4.5)
+VlnPlot(scRNA_harmony, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), 
+        ncol = 3)
+dev.off()
+
+
+##QC：统计基因数，RNA，线粒体基因分布
+gene.freq <- do.call("cbind", tapply(scRNA_harmony@meta.data$nFeature_RNA,scRNA_harmony@meta.data$orig.ident,quantile,probs=seq(0,1,0.05)))
+rna.freq <- do.call("cbind", tapply(scRNA_harmony@meta.data$nCount_RNA,scRNA_harmony@meta.data$orig.ident,quantile,probs=seq(0,1,0.05)))
+mt.freq <- do.call("cbind", tapply(scRNA_harmony@meta.data$percent.mt,scRNA_harmony@meta.data$orig.ident,quantile,probs=seq(0,1,0.05)))
+freq.combine <- as.data.frame(cbind(gene.freq,rna.freq,mt.freq))
+colnames(freq.combine) <- c(paste(colnames(gene.freq),"Gene",sep = "_"),
+                            paste(colnames(rna.freq),"RNA",sep = "_"),
+                            paste(colnames(mt.freq),"MT",sep = "_"))
+write.table(freq.combine,file = paste0(sam.name,"/QC-gene_frequency.txt"),quote = F,sep = "\t")
+rm(gene.freq,rna.freq,mt.freq)
+View(freq.combine)
+
+##QC：基因数与线粒体基因以及RNA数量的分布相关性
+plot1 <- FeatureScatter(scRNA_harmony, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(scRNA_harmony, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+pdf(paste0("./",sam.name,"/QC-FeatureScatter.pdf"),width = 8,height = 4.5)
+CombinePlots(plots = list(plot1, plot2),legend = "none")
+dev.off()
+
+
+#### 5. 筛选细胞 ####
+cat("Before filter :",nrow(scRNA_harmony@meta.data),"cells\n")
+#Before filter : 72396 cells  57443 cells
+VlnPlot(scRNA_harmony, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, pt.size=0.05)
+scRNA_harmony <- subset(scRNA_harmony, 
+                               subset =  nFeature_RNA > 300 &nFeature_RNA < 6000 &  
+                                 nCount_RNA > 1000 & 
+                                 nCount_RNA < 4500 &
+                                 percent.mt < 10 )
+#scRNA1 <- subset(scRNA, subset = nFeature_RNA > 300& nFeature_RNA < 5000 & 
+#                    percent.mt < 10 & percent.HB < 3 & nCount_RNA < 100000)  
+
+cat("scRNA_harmony :",nrow(scRNA_harmony@meta.data),"cells\n")
+#scRNA_harmony : 71109 cells  56458 cells
+
+#### 6. 表达量标准化 ####
+scRNA_harmony <- NormalizeData(scRNA_harmony, 
+                                      normalization.method = "LogNormalize",
+                                      scale.factor = 10000)
+
+#计算表达量变化显著的基因FindVariableFeatures
+scRNA_harmony <- FindVariableFeatures(scRNA_harmony, 
+                                             selection.method = "vst",
+                                             nfeatures = 1000)
+
+
+#展示标准化之后的整体表达水平
+top10 <- head(x = VariableFeatures(scRNA_harmony), 10)#这里存一个表格文件
+plot1 <- VariableFeaturePlot(scRNA_harmony)
+plot2 <- LabelPoints(plot = plot1, points = top10)
+pdf(file = paste0(sam.name,"/Norm-feature_variable_plot1.pdf"),width = 8,height = 5)
+CombinePlots(plots = list(plot1, plot2),legend = "none")
+dev.off()
+
+#### 7. 均一化与PCA ####
+#均一化（需要一点时间）
+scRNA_harmony <- ScaleData(
+  object = scRNA_harmony,
+  do.scale = FALSE,
+  do.center = FALSE,
+  vars.to.regress = c("orig.ident","percent.mt"))
+
+#PCA计算
+scRNA_harmony <- RunPCA(object = scRNA_harmony, 
+                               features = VariableFeatures(scRNA_harmony),
+                               verbose = F,npcs = 50)
+
+#PCA结果展示-1
+pdf(paste0("./",sam.name,"/PCA-VizDimLoadings.pdf"),width = 7,height = 5)
+VizDimLoadings(scRNA_harmony, dims = 1:2, reduction = "pca")
+dev.off()
+
+#PCA结果展示-2
+pdf(paste0("./",sam.name,"/PCA-DimPlot.pdf"),width = 5,height = 4)
+DimPlot(scRNA_harmony, reduction = "pca")
+dev.off()
+
+#PCA结果展示-3
+pdf(paste0("./",sam.name,"/PCA-DimHeatmap.pdf"),width = 5,height = 4)
+DimHeatmap(scRNA_harmony, dims = 1:6, cells = 500, balanced = TRUE)
+dev.off()
+
+
+#### 8. 确定细胞类群分析PC ####
+#耗时较久
+scRNA_harmony <- JackStraw(scRNA_harmony, num.replicate = 100,dims = 40).
+scRNA_harmony <- ScoreJackStraw(scRNA_harmony, dims = 1:40)
+pdf(paste0("./",sam.name,"/PCA-JackStrawPlot_40.pdf"),width = 6,height = 5)
+JackStrawPlot(object = scRNA_harmony, dims = 1:40)
+dev.off()
+
+#碎石图
+pdf(paste0("./",sam.name,"/PCA-ElbowPlot.pdf"),width = 6,height = 5)
+ElbowPlot(scRNA_harmony,ndims = 40)
+dev.off()
+
+#确定用于细胞分群的PC
+dim.use <- 1:20
+
+save(scRNA_harmony,file = 'PAAD-PCA.RData')
+
+
+
+#### 9. 细胞分群TSNE算法 ####
+#TSNE算法
+scRNA_harmony <- FindNeighbors(scRNA_harmony, dims = dim.use)
+scRNA_harmony <- FindClusters(scRNA_harmony, resolution = 0.4)
+
+scRNA_harmony <- RunTSNE(scRNA_harmony, dims = dim.use, 
+                                do.fast = TRUE)
+scRNA_harmony <- RunUMAP(scRNA_harmony, reduction = "pca", dims = dim.use)
+pdf(paste0("./",sam.name,"/CellCluster-TSNEPlot_res0.5_",max(dim.use),"PC.pdf"),width = 5,height = 4)
+DimPlot(object = scRNA_harmony, pt.size=0.5,label = T)
+dev.off()
+save(scRNA_harmony,file = 'cluster28.RData')
+#UMAP可视化结果
+
+pdf(paste0("./",sam.name,"/umap.pdf"),width = 10,height = 7)
+DimPlot(scRNA_harmony, reduction = "umap", label = T,pt.size = 0.5)
+dev.off()
+#tsne可视化结果
+pdf(paste0("./",sam.name,"/tsne.pdf"),width = 10,height = 7)
+DimPlot(scRNA_harmony, reduction = "tsne", label = TRUE,pt.size = 0.5)
+dev.off()
+#按照数据来源分组展示细胞异同--画在一张图中
+pdf(paste0("./",sam.name,"/CellCluster-TSNEPlot_SamGroup_",max(dim.use),"PC.pdf"),width = 5,height = 4)
+DimPlot(object = scRNA_harmony, 
+        group.by="orig.ident", 
+        pt.size=0.5,reduction = "tsne")
+dev.off()
+
+#按照数据来源分组展示细胞异同--画在多张图中
+pdf(paste0("./",sam.name,"/CellCluster-TSNEPlot_SamGroup_slipt_",max(dim.use),"PC.pdf"),width = 8,height = 4)
+DimPlot(object = scRNA_harmony, 
+        split.by ="orig.ident", 
+        pt.size=0.5,reduction = "tsne")
+dev.off()
+
+
+
+
+table(scRNA_harmony@meta.data$orig.ident)
+N1  N10  N11   N2   N3   N4   N5   N6   N7   N8   N9   T1  T10  T11  T12  T13  T14  T15  T16  T17 
+2809 1464 1362 1925  452  967  877  712 1107 1157 2435 1163  824 3130 2251 2026 1946 1908 1569 1999 
+T18  T19   T2  T20  T21  T22  T23  T24   T3   T4   T5   T6   T7   T8   T9 
+1507 2869 3032  458  769 2206 2837 1794 1311 1014 1098 1819  720  648 2293 
